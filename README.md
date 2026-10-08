@@ -1,4 +1,4 @@
-# Umbria broker — un point d'entrée unique vers plusieurs conteneurs Kyber
+# ky-broker — un point d'entrée unique vers plusieurs conteneurs Kyber
 
 Les joueurs n'utilisent qu'**une IP et deux ports** (443/tcp pour la page web, 9000/udp pour le flux).
 Le broker attribue à chaque nouveau joueur un conteneur Kyber **libre**, saute ceux qui sont occupés,
@@ -15,8 +15,8 @@ Joueur 192.168.1.50 ─┬─ TCP 443 ─► HAProxy ─┬─ cookie valide ─
 
 | Rôle | Qui | Ce qu'il fait |
 |---|---|---|
-| **Plan de contrôle** | `umbria_broker.py` (Python) | Décide qui va où, surveille l'activité et la santé, recycle les conteneurs |
-| **Plan de données web** | HAProxy | Route chaque requête selon le cookie `UMBRIA_SESSION`, via une *map* modifiée à chaud |
+| **Plan de contrôle** | `ky_broker.py` (Python) | Décide qui va où, surveille l'activité et la santé, recycle les conteneurs |
+| **Plan de données web** | HAProxy | Route chaque requête selon le cookie `KYBER_SESSION`, via une *map* modifiée à chaud |
 | **Plan de données UDP** | Noyau Linux (nftables) | Redirige les paquets selon l'IP du joueur, via une *map* nft modifiée à chaud |
 
 **Aucun paquet de jeu ne passe par Python** : la latence ajoutée est nulle et le conteneur voit la vraie IP
@@ -39,7 +39,7 @@ N'importe quel état ──(health check échoue)──► DOWN ──(de nouvea
 | FREE → RESERVED | Un joueur sans session arrive | Jeton aléatoire + cookie, entrée HAProxy, entrée nft, purge conntrack |
 | RESERVED → IN_USE | L'IP du joueur apparaît dans le set nft `seen` | — |
 | RESERVED → RECYCLING | Aucun paquet UDP pendant `reserve_timeout_s` (60 s) | Révocation (voir ci-dessous) + `podman restart` |
-| IN_USE → RECYCLING | L'IP a disparu du set `seen` (aucun paquet depuis `idle_timeout_s`) ou le joueur ouvre `/_umbria/leave` | Révocation + `podman restart` |
+| IN_USE → RECYCLING | L'IP a disparu du set `seen` (aucun paquet depuis `idle_timeout_s`) ou le joueur ouvre `/_kyber/leave` | Révocation + `podman restart` |
 | RECYCLING → FREE | `rise` health checks réussis après le redémarrage | — |
 | RECYCLING → DOWN | Redémarrage en échec, ou pas sain après `recycle_timeout_s` | — |
 | * → DOWN | `fall` health checks échoués d'affilée | Révocation de la session éventuelle |
@@ -64,7 +64,7 @@ Toutes les `reconcile_s` secondes, le broker compare l'état voulu au système r
 table nft effacée par un rechargement du pare-feu → reconstruite ; entrée manquante ou orpheline
 → corrigée ; HAProxy redémarré → map resynchronisée. Après une reconstruction, un délai de grâce
 évite d'éjecter les joueurs en cours pendant que le set `seen` se remplit à nouveau.
-Au redémarrage du broker, l'état est relu depuis `/var/lib/umbria/state.json` : les parties en cours
+Au redémarrage du broker, l'état est relu depuis `/var/lib/kyber/state.json` : les parties en cours
 continuent.
 
 ## 3. Prérequis
@@ -98,12 +98,12 @@ Avec `--network host` à la place : `ip` = IP LAN de l'hôte et des ports diffé
 ### 4.2 Fichiers
 
 ```bash
-sudo install -d /opt/umbria /etc/umbria
-sudo install -m 755 umbria_broker.py /opt/umbria/
-sudo install -m 644 README.md /opt/umbria/
-sudo install -m 640 broker.toml /etc/umbria/broker.toml
-sudo nano /etc/umbria/broker.toml        # IP, ports, noms des conteneurs, réseau admin
-sudo python3 /opt/umbria/umbria_broker.py -c /etc/umbria/broker.toml check
+sudo install -d /opt/kyber /etc/kyber
+sudo install -m 755 ky_broker.py /opt/kyber/
+sudo install -m 644 README.md /opt/kyber/
+sudo install -m 640 broker.toml /etc/kyber/broker.toml
+sudo nano /etc/kyber/broker.toml        # IP, ports, noms des conteneurs, réseau admin
+sudo python3 /opt/kyber/ky_broker.py -c /etc/kyber/broker.toml check
 ```
 
 ### 4.3 Certificat HTTPS
@@ -113,11 +113,11 @@ réservent aux pages HTTPS. Pour le réseau local, un certificat auto-signé suf
 
 ```bash
 sudo install -d -m 750 -g haproxy /etc/haproxy/certs
-sudo openssl req -x509 -newkey rsa:2048 -nodes -days 825 -subj "/CN=umbria.lan" \
-  -addext "subjectAltName=DNS:umbria.lan,IP:192.168.1.10" \
-  -keyout /tmp/umbria.key -out /tmp/umbria.crt
-sudo sh -c 'cat /tmp/umbria.crt /tmp/umbria.key > /etc/haproxy/certs/umbria.pem && rm /tmp/umbria.key'
-sudo chmod 640 /etc/haproxy/certs/umbria.pem && sudo chgrp haproxy /etc/haproxy/certs/umbria.pem
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 825 -subj "/CN=kyber.lan" \
+  -addext "subjectAltName=DNS:kyber.lan,IP:192.168.1.10" \
+  -keyout /tmp/kyber.key -out /tmp/kyber.crt
+sudo sh -c 'cat /tmp/kyber.crt /tmp/kyber.key > /etc/haproxy/certs/kyber.pem && rm /tmp/kyber.key'
+sudo chmod 640 /etc/haproxy/certs/kyber.pem && sudo chgrp haproxy /etc/haproxy/certs/kyber.pem
 ```
 
 Remplacez `192.168.1.10` par l'IP du serveur. Chaque client doit accepter (ou importer) le certificat
@@ -126,10 +126,10 @@ une fois. Sans HTTPS : `tls_cert = ""` et `cookie_secure = false`.
 ### 4.4 HAProxy
 
 ```bash
-sudo install -m 644 systemd/umbria.tmpfiles.conf /etc/tmpfiles.d/umbria.conf
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/umbria.conf    # crée la map vide : HAProxy l'exige
+sudo install -m 644 systemd/kyber.tmpfiles.conf /etc/tmpfiles.d/kyber.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/kyber.conf    # crée la map vide : HAProxy l'exige
 sudo cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.orig
-sudo sh -c 'python3 /opt/umbria/umbria_broker.py -c /etc/umbria/broker.toml render-haproxy > /etc/haproxy/haproxy.cfg'
+sudo sh -c 'python3 /opt/kyber/ky_broker.py -c /etc/kyber/broker.toml render-haproxy > /etc/haproxy/haproxy.cfg'
 sudo haproxy -c -f /etc/haproxy/haproxy.cfg
 sudo systemctl enable --now haproxy
 ```
@@ -153,10 +153,10 @@ Avec firewalld : `sudo firewall-cmd --permanent --add-port={443/tcp,9000/udp} &&
 ### 4.6 Service systemd
 
 ```bash
-sudo install -m 644 systemd/umbria-broker.service /etc/systemd/system/
+sudo install -m 644 systemd/ky-broker.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now umbria-broker
-journalctl -u umbria-broker -f
+sudo systemctl enable --now ky-broker
+journalctl -u ky-broker -f
 ```
 
 Au tout premier démarrage, le broker redémarre chaque conteneur (il ne sait pas qui les a utilisés
@@ -167,26 +167,26 @@ avant lui) : comptez quelques dizaines de secondes avant que les postes passent 
 | Qui | Adresse | Effet |
 |---|---|---|
 | Joueur | `https://<serveur>/` | Attribution d'un poste libre, ou file d'attente (page qui se recharge seule) |
-| Joueur | `https://<serveur>/_umbria/leave` | Termine la session tout de suite et libère le poste |
-| Admin | `https://<serveur>/_umbria/admin` | Tableau des postes, bouton « Recycler » |
-| Admin | `https://<serveur>/_umbria/status` | État en JSON |
-| Admin | `https://<serveur>/_umbria/metrics` | Métriques Prometheus (pour Grafana) |
+| Joueur | `https://<serveur>/_kyber/leave` | Termine la session tout de suite et libère le poste |
+| Admin | `https://<serveur>/_kyber/admin` | Tableau des postes, bouton « Recycler » |
+| Admin | `https://<serveur>/_kyber/status` | État en JSON |
+| Admin | `https://<serveur>/_kyber/metrics` | Métriques Prometheus (pour Grafana) |
 
 Les pages d'administration ne répondent qu'aux réseaux listés dans `admin_networks`.
 
 ## 6. Vérifications
 
 ```bash
-sudo nft list table ip umbria                    # règles, sessions, IP actives (set seen)
-echo "show map /etc/haproxy/maps/umbria-sessions.map" | sudo socat - /run/haproxy/admin.sock
+sudo nft list table ip kyber                    # règles, sessions, IP actives (set seen)
+echo "show map /etc/haproxy/maps/kyber-sessions.map" | sudo socat - /run/haproxy/admin.sock
 sudo conntrack -L -p udp --orig-port-dst 9000    # flux UDP en cours et leur redirection
-curl -sk https://127.0.0.1/_umbria/status | python3 -m json.tool
+curl -sk https://127.0.0.1/_kyber/status | python3 -m json.tool
 ```
 
 ## 7. Tests
 
 ```bash
-python3 -m unittest -v test_umbria_broker.py     # 20 tests de la machine à états, sans root
+python3 -m unittest -v test_ky_broker.py         # 20 tests de la machine à états, sans root
 sudo ./maquette/maquette.sh                      # maquette réseau réelle (~1 min), voir ci-dessous
 ```
 
@@ -199,9 +199,9 @@ Elle ne touche ni au réseau de l'hôte ni aux conteneurs. Sa sortie est une bon
 
 | Symptôme | Piste |
 |---|---|
-| HAProxy ne démarre pas : *failed to open pattern file* | La map n'existe pas : `sudo systemd-tmpfiles --create /etc/tmpfiles.d/umbria.conf` |
+| HAProxy ne démarre pas : *failed to open pattern file* | La map n'existe pas : `sudo systemd-tmpfiles --create /etc/tmpfiles.d/kyber.conf` |
 | Page web OK, mais pas d'image | Port UDP : vérifier `udp_port`/`public_port` (§3), le pare-feu (§4.5), puis `sudo conntrack -L -p udp` |
-| Le poste reste RESERVED puis est recyclé | Aucun paquet UDP n'arrive sur `public_port` : `sudo nft list set ip umbria seen` pendant la connexion |
+| Le poste reste RESERVED puis est recyclé | Aucun paquet UDP n'arrive sur `public_port` : `sudo nft list set ip kyber seen` pendant la connexion |
 | Les postes passent DOWN | `podman ps`, `curl http://10.88.0.11:8080/`, puis le journal du conteneur |
 | Tests depuis le serveur lui-même | Ne marchent pas pour l'UDP : le trafic local ne passe pas par *prerouting*. Testez depuis un autre PC |
 | « Préparation de votre session… » en boucle | Le broker n'arrive pas à écrire dans HAProxy : vérifier le socket `/run/haproxy/admin.sock` |
