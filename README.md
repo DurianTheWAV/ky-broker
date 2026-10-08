@@ -150,6 +150,8 @@ sudo ufw route allow proto udp to 10.88.0.0/16 port 9000
 
 With firewalld: `sudo firewall-cmd --permanent --add-port={443/tcp,9000/udp} && sudo firewall-cmd --reload`.
 
+Do **not** open the admin port (8443, see §5.1): it stays off the firewall, the router and any tunnel.
+
 ### 4.6 systemd service
 
 ```bash
@@ -168,11 +170,34 @@ before it): allow a few dozen seconds before the stations turn FREE.
 |---|---|---|
 | Player | `https://<server>/` | Assigns a free station, or queues (self-reloading page) |
 | Player | `https://<server>/_kyber/leave` | Ends the session immediately and frees the station |
-| Admin | `https://<server>/_kyber/admin` | Station table, "Recycle" button |
-| Admin | `https://<server>/_kyber/status` | State as JSON |
-| Admin | `https://<server>/_kyber/metrics` | Prometheus metrics (for Grafana) |
+| Admin | `https://127.0.0.1:8443/_kyber/admin` | Station table, "Recycle" button |
+| Admin | `https://127.0.0.1:8443/_kyber/status` | State as JSON |
+| Admin | `https://127.0.0.1:8443/_kyber/metrics` | Prometheus metrics (for Grafana) |
 
-The admin pages only answer the networks listed in `admin_networks`.
+### 5.1 Admin pages stay off the public port
+
+The admin pages are **never** served on the public port (443), whoever asks: HAProxy answers
+404 there, and so does the broker's player listener. They only exist on a separate admin port,
+so forwarding 443 on the router, or putting it behind a tunnel (Cloudflare Tunnel, ngrok…),
+exposes the game and nothing else. Filtering by source IP alone would not be enough: a tunnel
+running on the server, or a router doing NAT hairpinning, makes Internet visitors look local.
+
+| Setting | Default | Role |
+|---|---|---|
+| `[haproxy] admin_bind` | `127.0.0.1:8443` | Admin HTTPS frontend. `""` = none |
+| `[broker] admin_listen` | `127.0.0.1:8098` | Broker's admin listener, behind `admin_bind` |
+| `[broker] admin_networks` | `["127.0.0.0/8"]` | Extra check: who may use the admin port |
+
+By default the admin pages are only reachable from the server itself. From another PC, use an
+SSH tunnel:
+
+```bash
+ssh -L 8443:127.0.0.1:8443 user@<server>      # then open https://127.0.0.1:8443/ on the PC
+```
+
+To reach them from the LAN directly, set `admin_bind = "192.168.1.10:8443"` (the server's LAN IP)
+and add your LAN to `admin_networks`, then regenerate `haproxy.cfg`. Never forward or tunnel
+that port: it must not be reachable from the Internet.
 
 ## 6. Checks
 
@@ -180,7 +205,7 @@ The admin pages only answer the networks listed in `admin_networks`.
 sudo nft list table ip kyber                    # rules, sessions, active IPs (seen set)
 echo "show map /etc/haproxy/maps/kyber-sessions.map" | sudo socat - /run/haproxy/admin.sock
 sudo conntrack -L -p udp --orig-port-dst 9000    # ongoing UDP flows and their redirection
-curl -sk https://127.0.0.1/_kyber/status | python3 -m json.tool
+curl -sk https://127.0.0.1:8443/_kyber/status | python3 -m json.tool
 ```
 
 ## 7. Tests
