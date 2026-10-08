@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 """
-ky-broker — un point d'entrée unique (IP + port) vers plusieurs conteneurs Kyber.
+ky-broker — a single entry point (IP + port) to several Kyber containers.
 
-Chaque conteneur (« slot ») suit la machine à états :
+Each container ("slot") follows this state machine:
 
-    FREE ──(joueur attribué)──► RESERVED ──(trafic UDP reçu)──► IN_USE
-     ▲                              │ (rien reçu en 60 s)          │ (plus de trafic depuis N s)
+    FREE ──(player assigned)──► RESERVED ──(UDP traffic seen)──► IN_USE
+     ▲                              │ (nothing within 60 s)        │ (no traffic for N s)
      │                              ▼                              ▼
      └────────── RECYCLING ◄────────┴──────────────────────────────┘
-              (podman restart, puis retour à FREE)
+              (podman restart, then back to FREE)
 
-    N'importe quel état ──(health check échoue)──► DOWN
-    DOWN ──(conteneur de nouveau sain, ou relance auto)──► RECYCLING
+    Any state ──(health check fails)──► DOWN
+    DOWN ──(container healthy again, or automatic retry)──► RECYCLING
 
-Invariant : le seul chemin vers FREE passe par RECYCLING. Un joueur ne retrouve
-donc jamais la session (jeu, compte Steam) du joueur précédent.
+Invariant: the only way to FREE goes through RECYCLING, so a player never
+inherits the previous player's session (game, Steam account).
 
-Répartition des rôles :
-  * plan de contrôle : ce programme (décide qui va où, surveille, recycle) ;
-  * plan de données  : HAProxy pour le web (cookie -> conteneur, via une map
-    modifiée à chaud par le socket d'administration) et le noyau (nftables)
-    pour l'UDP (IP du joueur -> conteneur). Aucun paquet de jeu ne passe par
-    Python, donc aucune latence ajoutée.
+Division of roles:
+  * control plane: this program (decides who goes where, monitors, recycles);
+  * data plane:    HAProxy for the web (cookie -> container, through a map
+    updated live via the admin socket) and the kernel (nftables) for UDP
+    (player IP -> container). No game packet ever goes through Python, so
+    no latency is added.
 
-Dépendances : Python >= 3.11 (bibliothèque standard uniquement), nft,
+Dependencies: Python >= 3.11 (standard library only), nft,
 conntrack (conntrack-tools), podman, haproxy.
 """
 from __future__ import annotations
@@ -56,12 +56,12 @@ log = logging.getLogger("kyber")
 
 @dataclass
 class SlotConfig:
-    name: str            # identifiant court (k1, k2…) — sert aussi au nom du backend HAProxy
-    container: str       # nom du conteneur Podman
-    ip: str              # IP du conteneur (bridge Podman) ou de l'hôte (--network host)
-    web_port: int        # port du serveur web Kyber dans le conteneur
-    udp_port: int        # port UDP du flux Kyber dans le conteneur
-    web_tls: bool = False  # le serveur web Kyber parle-t-il HTTPS ?
+    name: str            # short id (k1, k2…) — also used for the HAProxy backend name
+    container: str       # Podman container name
+    ip: str              # container IP (Podman bridge) or host IP (--network host)
+    web_port: int        # Kyber web server port inside the container
+    udp_port: int        # Kyber UDP stream port inside the container
+    web_tls: bool = False  # does the Kyber web server speak HTTPS?
 
 
 @dataclass
@@ -139,45 +139,45 @@ class Config:
 
     def validate(self) -> None:
         if not self.slots:
-            raise ValueError("aucun [[slot]] défini dans la configuration")
+            raise ValueError("no [[slot]] defined in the configuration")
         names = set()
         for s in self.slots:
             if not s.name.replace("-", "").replace("_", "").isalnum():
-                raise ValueError(f"nom de slot invalide : {s.name!r}")
+                raise ValueError(f"invalid slot name: {s.name!r}")
             if s.name in names:
-                raise ValueError(f"slot en double : {s.name}")
+                raise ValueError(f"duplicate slot: {s.name}")
             names.add(s.name)
             ipaddress.IPv4Address(s.ip)
         for net in self.admin_networks:
             ipaddress.ip_network(net, strict=False)
         if self.health_mode not in ("tcp", "http"):
-            raise ValueError("health.mode doit valoir 'tcp' ou 'http'")
+            raise ValueError("health.mode must be 'tcp' or 'http'")
         if int(self.idle_timeout_s) < 1:
-            raise ValueError("idle_timeout_s doit être >= 1 (le set nftables compte en secondes)")
+            raise ValueError("idle_timeout_s must be >= 1 (the nftables set counts in seconds)")
         if not any("{container}" in a for a in self.recycle_command):
-            raise ValueError("recycle.command doit contenir {container}")
+            raise ValueError("recycle.command must contain {container}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Générateurs : règles nftables et haproxy.cfg (une seule source de vérité)
+#  Generators: nftables rules and haproxy.cfg (single source of truth)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def render_nft(cfg: Config) -> str:
     iif = f'iifname "{cfg.udp_interface}" ' if cfg.udp_interface else ""
     t, p = cfg.nft_table, cfg.udp_public_port
     return f"""\
-# Généré par ky_broker — ne pas modifier à la main.
-# « table puis delete table » rend le chargement idempotent.
+# Generated by ky_broker — do not edit by hand.
+# "table then delete table" makes loading idempotent.
 table ip {t}
 delete table ip {t}
 table ip {t} {{
-    # IP du joueur -> IP du conteneur . port UDP Kyber (rempli par le broker)
+    # player IP -> container IP . Kyber UDP port (filled in by the broker)
     map sessions {{
         type ipv4_addr : ipv4_addr . inet_service
     }}
 
-    # Activité : chaque paquet UDP rafraîchit l'IP source pour {int(cfg.idle_timeout_s)} s.
-    # Présente dans le set = trafic récent ; absente = inactif depuis N s.
+    # Activity: each UDP packet refreshes the source IP for {int(cfg.idle_timeout_s)} s.
+    # Present in the set = recent traffic; absent = idle for N s.
     set seen {{
         type ipv4_addr
         size 4096
@@ -185,8 +185,8 @@ table ip {t} {{
         timeout {int(cfg.idle_timeout_s)}s
     }}
 
-    # Priorité mangle : vue AVANT le DNAT et pour CHAQUE paquet
-    # (les chaînes nat ne voient que le premier paquet d'un flux).
+    # Mangle priority: sees EVERY packet, BEFORE DNAT
+    # (nat chains only see the first packet of a flow).
     chain activity {{
         type filter hook prerouting priority mangle; policy accept;
         {iif}udp dport {p} update @seen {{ ip saddr }}
@@ -206,7 +206,7 @@ def render_haproxy(cfg: Config) -> str:
     if tls:
         bind += f" ssl crt {tls} alpn h2,http/1.1"
     lines = [
-        "# Généré par ky_broker render-haproxy — régénérer plutôt que modifier.",
+        "# Generated by ky_broker render-haproxy — regenerate rather than edit.",
         "global",
         "    log /dev/log local0",
         f"    stats socket {cfg.haproxy_socket} mode 660 level admin expose-fd listeners",
@@ -222,17 +222,17 @@ def render_haproxy(cfg: Config) -> str:
         "    timeout connect 5s",
         "    timeout client  60s",
         "    timeout server  60s",
-        "    timeout tunnel  4h     # WebSocket Kyber : une partie peut durer longtemps",
+        "    timeout tunnel  4h     # Kyber WebSocket: a game can last a long time",
         "",
         "frontend fe_kyber",
         f"    {bind}",
-        "    # L'IP vue par le broker doit être celle posée par HAProxy, jamais celle du client",
+        "    # The IP seen by the broker must be the one set by HAProxy, never the client's",
         "    http-request del-header X-Forwarded-For",
         "    option forwardfor",
         f"    http-request set-header X-Forwarded-Proto {'https' if tls else 'http'}",
-        "    # Pages du broker : file d'attente, quitter, administration",
+        "    # Broker pages: queue, leave, administration",
         "    use_backend bk_broker if { path_beg /_kyber/ }",
-        "    # Cookie de session valide -> conteneur attribué ; sinon -> broker",
+        "    # Valid session cookie -> assigned container; otherwise -> broker",
         f"    use_backend %[req.cook({cfg.cookie_name}),map({cfg.haproxy_map},bk_broker)]",
         "    default_backend bk_broker",
         "",
@@ -244,7 +244,7 @@ def render_haproxy(cfg: Config) -> str:
         ssl_opt = " ssl verify none" if s.web_tls else ""
         lines += [
             f"backend bk_{s.name}",
-            f"    # conteneur {s.container}",
+            f"    # container {s.container}",
             f"    server {s.name} {s.ip}:{s.web_port}{ssl_opt}",
             "",
         ]
@@ -252,7 +252,7 @@ def render_haproxy(cfg: Config) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Infra : tout ce qui touche au système (remplacé par un faux dans les tests)
+#  Infra: everything that touches the system (replaced by a fake in tests)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class InfraError(RuntimeError):
@@ -260,7 +260,7 @@ class InfraError(RuntimeError):
 
 
 class Infra:
-    """Accès au noyau (nft, conntrack), à HAProxy et à Podman."""
+    """Access to the kernel (nft, conntrack), HAProxy and Podman."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -277,11 +277,11 @@ class Infra:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            raise InfraError(f"délai dépassé : {shlex.join(argv)}")
+            raise InfraError(f"timed out: {shlex.join(argv)}")
         rc = proc.returncode
         o, e = out.decode(errors="replace"), err.decode(errors="replace")
         if check and rc != 0:
-            raise InfraError(f"{shlex.join(argv)} -> code {rc} : {e.strip() or o.strip()}")
+            raise InfraError(f"{shlex.join(argv)} -> exit code {rc}: {e.strip() or o.strip()}")
         return rc, o, e
 
     # ── nftables ───────────────────────────────────────────────────────────
@@ -301,12 +301,12 @@ class Infra:
 
     async def nft_session_del(self, client_ip: str) -> None:
         for obj in ("sessions", "seen"):
-            # absent = déjà supprimé, ce n'est pas une erreur
+            # missing = already removed, not an error
             await self._run("nft", "delete", "element", "ip", self.cfg.nft_table, obj,
                             f"{{ {client_ip} }}", check=False)
 
     async def nft_sessions(self) -> dict[str, str]:
-        """IP joueur -> 'ip_conteneur.port' actuellement dans la map du noyau."""
+        """Player IP -> 'container_ip.port' currently in the kernel map."""
         _, out, _ = await self._run("nft", "-j", "list", "map", "ip", self.cfg.nft_table, "sessions")
         res = {}
         for obj in json.loads(out).get("nftables", []):
@@ -317,7 +317,7 @@ class Infra:
         return res
 
     async def nft_seen(self) -> set[str]:
-        """IP ayant envoyé de l'UDP sur le port public dans les N dernières secondes."""
+        """IPs that sent UDP to the public port within the last N seconds."""
         _, out, _ = await self._run("nft", "-j", "list", "set", "ip", self.cfg.nft_table, "seen")
         seen = set()
         for obj in json.loads(out).get("nftables", []):
@@ -331,20 +331,20 @@ class Infra:
         return seen
 
     async def conntrack_flush(self, client_ip: str) -> None:
-        """Oublie les flux UDP en cours : sinon le noyau garde l'ancienne redirection."""
+        """Forget ongoing UDP flows: otherwise the kernel keeps the old redirection."""
         try:
             await self._run("conntrack", "-D", "-p", "udp", "--orig-src", client_ip,
                             "--orig-port-dst", str(self.cfg.udp_public_port), check=False)
         except FileNotFoundError:
-            log.warning("conntrack introuvable (paquet conntrack-tools) : flux non purgés")
+            log.warning("conntrack not found (conntrack-tools package): flows not flushed")
 
-    # ── HAProxy (socket d'administration) ─────────────────────────────────
+    # ── HAProxy (admin socket) ─────────────────────────────────────────────
     async def haproxy_cmd(self, cmd: str) -> str:
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_unix_connection(self.cfg.haproxy_socket), 3)
         except (OSError, asyncio.TimeoutError) as exc:
-            raise InfraError(f"socket HAProxy injoignable ({self.cfg.haproxy_socket}) : {exc}")
+            raise InfraError(f"HAProxy socket unreachable ({self.cfg.haproxy_socket}): {exc}")
         try:
             writer.write((cmd + "\n").encode())
             await writer.drain()
@@ -355,10 +355,10 @@ class Infra:
 
     async def haproxy_set(self, token: str, backend: str) -> None:
         m = self.cfg.haproxy_map
-        await self.haproxy_cmd(f"del map {m} {token}")          # « Key not found » : normal
+        await self.haproxy_cmd(f"del map {m} {token}")          # "Key not found" is expected
         res = await self.haproxy_cmd(f"add map {m} {token} {backend}")
-        if res:                                                  # succès = réponse vide
-            raise InfraError(f"HAProxy a refusé l'entrée : {res}")
+        if res:                                                  # success = empty reply
+            raise InfraError(f"HAProxy rejected the entry: {res}")
 
     async def haproxy_del(self, token: str) -> None:
         await self.haproxy_cmd(f"del map {self.cfg.haproxy_map} {token}")
@@ -368,12 +368,12 @@ class Infra:
         res = {}
         for line in out.splitlines():
             parts = line.split()
-            if len(parts) == 3:  # « 0x55… clé valeur »
+            if len(parts) == 3:  # "0x55… key value"
                 res[parts[1]] = parts[2]
         return res
 
     def write_map_file(self, entries: dict[str, str]) -> None:
-        """Copie disque de la map : HAProxy la relit à chaque (re)démarrage."""
+        """On-disk copy of the map: HAProxy reloads it on every (re)start."""
         path = Path(self.cfg.haproxy_map)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
@@ -386,7 +386,7 @@ class Infra:
             pass
         os.replace(tmp, path)
 
-    # ── Podman et health checks ───────────────────────────────────────────
+    # ── Podman and health checks ──────────────────────────────────────────
     async def recycle(self, slot: SlotConfig) -> None:
         argv = [a.replace("{container}", slot.container) for a in self.cfg.recycle_command]
         await self._run(*argv, timeout=120)
@@ -402,7 +402,7 @@ class Infra:
             if slot.web_tls:
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE   # certificat auto-signé du conteneur
+                ctx.verify_mode = ssl.CERT_NONE   # container's self-signed certificate
             r, w = await asyncio.wait_for(
                 asyncio.open_connection(slot.ip, slot.web_port, ssl=ctx), t)
             w.write(f"GET {self.cfg.health_path} HTTP/1.1\r\nHost: {slot.ip}\r\n"
@@ -417,7 +417,7 @@ class Infra:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Machine à états
+#  State machine
 # ═══════════════════════════════════════════════════════════════════════════
 
 class State(str, Enum):
@@ -434,9 +434,9 @@ class Slot:
     state: State = State.RECYCLING
     client_ip: str | None = None
     token: str | None = None
-    since: float = field(default_factory=time.time)   # entrée dans l'état courant
+    since: float = field(default_factory=time.time)   # entered the current state at
     last_activity: float = 0.0
-    reason: str = ""                                   # pourquoi on est dans cet état
+    reason: str = ""                                   # why we are in this state
     fails: int = 0
     oks: int = 0
     task: asyncio.Task | None = None
@@ -459,7 +459,7 @@ class Slot:
                 "reason": self.reason, "health_fails": self.fails}
 
 
-# Transitions autorisées — documente le schéma et attrape les bugs.
+# Allowed transitions — documents the diagram and catches bugs.
 ALLOWED = {
     State.FREE:      {State.RESERVED, State.RECYCLING, State.DOWN},
     State.RESERVED:  {State.IN_USE, State.RECYCLING, State.DOWN},
@@ -476,16 +476,16 @@ class Broker:
         self.now = clock
         self.slots: dict[str, Slot] = {s.name: Slot(s) for s in cfg.slots}
         self.lock = asyncio.Lock()
-        self.queue: dict[str, float] = {}          # IP en attente -> dernière visite (ordre FIFO)
+        self.queue: dict[str, float] = {}          # waiting IP -> last visit (FIFO order)
         self.admin_nets = [ipaddress.ip_network(n, strict=False) for n in cfg.admin_networks]
         self.stats = {"sessions_total": 0, "recycles_total": 0, "down_total": 0}
         self._bg: set[asyncio.Task] = set()
         self._stopping = False
-        # Après (re)chargement de la table nft, le set « seen » est vide : on laisse
-        # aux joueurs en cours le temps d'y réapparaître avant de les juger inactifs.
+        # After the nft table is (re)loaded, the "seen" set is empty: give current
+        # players time to show up in it again before deeming them idle.
         self.grace_until = 0.0
 
-    # ── utilitaires ───────────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────
     def by_token(self, token: str | None) -> Slot | None:
         if not token:
             return None
@@ -498,11 +498,11 @@ class Broker:
 
     def _set_state(self, slot: Slot, new: State, reason: str) -> None:
         if new not in ALLOWED[slot.state] and new != slot.state:
-            raise RuntimeError(f"transition interdite {slot.state.value} -> {new.value}")
+            raise RuntimeError(f"forbidden transition {slot.state.value} -> {new.value}")
         old = slot.state
         slot.state, slot.since, slot.reason = new, self.now(), reason
         log.info("[%s] %s -> %s (%s)%s", slot.name, old.value, new.value, reason,
-                 f" joueur {slot.client_ip}" if slot.client_ip else "")
+                 f" player {slot.client_ip}" if slot.client_ip else "")
 
     def persist(self) -> None:
         data = {"version": 1, "saved_at": self.now(),
@@ -512,12 +512,12 @@ class Broker:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
-        os.chmod(tmp, 0o600)                 # contient les jetons de session
+        os.chmod(tmp, 0o600)                 # contains session tokens
         os.replace(tmp, path)
         try:
             self.infra.write_map_file(self._desired_map())
         except OSError as exc:
-            log.warning("écriture de la map HAProxy impossible : %s", exc)
+            log.warning("cannot write the HAProxy map: %s", exc)
 
     def _desired_map(self) -> dict[str, str]:
         return {s.token: s.backend for s in self.slots.values()
@@ -532,7 +532,7 @@ class Broker:
         t.add_done_callback(self._bg.discard)
         return t
 
-    # ── démarrage : restaurer l'état et resynchroniser le plan de données ─
+    # ── startup: restore state and resync the data plane ────────────────
     async def start(self) -> None:
         saved = {}
         p = Path(self.cfg.state_file)
@@ -542,38 +542,38 @@ class Broker:
                 saved = data.get("slots", {})
                 self.stats.update(data.get("stats", {}))
             except (ValueError, OSError) as exc:
-                log.error("état illisible (%s) : on repart de zéro", exc)
+                log.error("unreadable state (%s): starting from scratch", exc)
         await self.infra.nft_load()
         self._grace()
         now = self.now()
         for name, slot in self.slots.items():
             st = saved.get(name)
             if st is None:
-                # Conteneur inconnu : on ne sait pas qui l'a utilisé -> recyclage.
-                self._begin_recycle(slot, "premier démarrage")
+                # Unknown container: we don't know who used it -> recycle.
+                self._begin_recycle(slot, "first start")
                 continue
             state = State(st["state"])
             if state in (State.RESERVED, State.IN_USE) and st.get("client_ip") and st.get("token"):
                 slot.state, slot.client_ip, slot.token = state, st["client_ip"], st["token"]
-                slot.since, slot.last_activity = now, now        # délai de grâce
-                slot.reason = "restauré"
+                slot.since, slot.last_activity = now, now        # grace period
+                slot.reason = "restored"
                 await self.infra.nft_session_add(slot.client_ip, slot.cfg)
             elif state == State.FREE:
-                slot.state, slot.since, slot.reason = State.FREE, now, "restauré"
+                slot.state, slot.since, slot.reason = State.FREE, now, "restored"
             elif state == State.DOWN:
-                slot.state, slot.since, slot.reason = State.DOWN, now, st.get("reason", "restauré")
-            else:   # RECYCLING interrompu
-                self._begin_recycle(slot, "recyclage interrompu, reprise")
+                slot.state, slot.since, slot.reason = State.DOWN, now, st.get("reason", "restored")
+            else:   # interrupted RECYCLING
+                self._begin_recycle(slot, "interrupted recycle, resuming")
         self.persist()
         await self._sync_haproxy()
-        log.info("broker démarré : %s", ", ".join(f"{s.name}={s.state.value}"
+        log.info("broker started: %s", ", ".join(f"{s.name}={s.state.value}"
                                                     for s in self.slots.values()))
 
     async def _sync_haproxy(self) -> None:
-        """Aligne la map vivante de HAProxy sur l'état voulu.
+        """Align HAProxy's live map with the desired state.
 
-        Sous verrou : sinon une synchro calculée juste avant un recyclage
-        pourrait remettre le jeton révoqué d'un ancien joueur."""
+        Under the lock: otherwise a sync computed just before a recycle
+        could restore a previous player's revoked token."""
         async with self.lock:
             want = self._desired_map()
             try:
@@ -584,54 +584,54 @@ class Broker:
                     if have.get(tok) != be:
                         await self.infra.haproxy_set(tok, be)
             except InfraError as exc:
-                log.warning("synchro HAProxy reportée : %s", exc)
+                log.warning("HAProxy sync postponed: %s", exc)
 
-    # ── attribution (appelée par le serveur HTTP) ─────────────────────────
+    # ── assignment (called by the HTTP server) ────────────────────────────
     async def assign(self, ip: str) -> tuple[str, Slot | None, int]:
-        """Retourne (« assigned » | « queued »), slot, position dans la file (1 = premier)."""
+        """Return ("assigned" | "queued"), slot, queue position (1 = first)."""
         async with self.lock:
             now = self.now()
             existing = self.by_ip(ip)
-            if existing:                       # même joueur (autre onglet, cookie perdu)
+            if existing:                       # same player (another tab, lost cookie)
                 self.queue.pop(ip, None)
                 return "assigned", existing, 0
 
-            # File FIFO : on oublie ceux qui ne rechargent plus la page d'attente.
+            # FIFO queue: forget those who no longer reload the waiting page.
             self.queue = {k: v for k, v in self.queue.items() if now - v < self.cfg.queue_ttl_s}
-            self.queue[ip] = now               # nouvelle entrée en fin ; sinon garde sa place
+            self.queue[ip] = now               # new entry goes last; otherwise keeps its place
             position = list(self.queue).index(ip)
             free = [s for s in self.slots.values() if s.state == State.FREE]
-            if position >= len(free):          # pas de poste libre pour mon rang
+            if position >= len(free):          # no free station for my rank
                 return "queued", None, position + 1
 
-            # Load balancing : le premier conteneur FREE ; les occupés sont sautés.
+            # Load balancing: first FREE container; busy ones are skipped.
             slot = free[0]
             self.queue.pop(ip)
             slot.client_ip, slot.token = ip, secrets.token_urlsafe(24)
             slot.last_activity, slot.fails = 0.0, 0
-            self._set_state(slot, State.RESERVED, "joueur attribué")
+            self._set_state(slot, State.RESERVED, "player assigned")
             self.stats["sessions_total"] += 1
             try:
                 await self.infra.nft_session_add(ip, slot.cfg)
-                # Un flux UDP déjà ouvert avant l'attribution (onglet qui réessaie) a une
-                # entrée conntrack SANS NAT : le noyau ne le redirigerait jamais.
+                # A UDP flow opened before assignment (a tab retrying) has a conntrack
+                # entry WITHOUT NAT: the kernel would never redirect it.
                 await self.infra.conntrack_flush(ip)
             except InfraError as exc:
-                log.error("[%s] nft : %s (réparé par la réconciliation)", slot.name, exc)
+                log.error("[%s] nft: %s (will be fixed by reconciliation)", slot.name, exc)
             try:
                 await self.infra.haproxy_set(slot.token, slot.backend)
             except InfraError as exc:
-                log.error("[%s] HAProxy : %s (resynchro au prochain cycle)", slot.name, exc)
+                log.error("[%s] HAProxy: %s (resync on next cycle)", slot.name, exc)
             self.persist()
             return "assigned", slot, 0
 
     async def leave(self, token: str | None, ip: str) -> bool:
-        """Le joueur clique « Quitter » : recyclage immédiat."""
+        """The player clicks "Leave": immediate recycle."""
         async with self.lock:
             slot = self.by_token(token)
             if not slot or slot.client_ip != ip or slot.state not in (State.RESERVED, State.IN_USE):
                 return False
-            self._begin_recycle(slot, "le joueur a quitté")
+            self._begin_recycle(slot, "player left")
             return True
 
     async def admin_recycle(self, name: str) -> bool:
@@ -639,12 +639,12 @@ class Broker:
             slot = self.slots.get(name)
             if not slot or slot.state == State.RECYCLING:
                 return False
-            self._begin_recycle(slot, "demande de l'administrateur")
+            self._begin_recycle(slot, "requested by administrator")
             return True
 
-    # ── recyclage ─────────────────────────────────────────────────────────
+    # ── recycling ─────────────────────────────────────────────────────────
     def _begin_recycle(self, slot: Slot, reason: str) -> None:
-        """Passe en RECYCLING et lance la tâche (à appeler sous self.lock ou au démarrage)."""
+        """Switch to RECYCLING and start the task (call under self.lock or at startup)."""
         if slot.state == State.RECYCLING and slot.task and not slot.task.done():
             return
         ip, token = slot.client_ip, slot.token
@@ -664,12 +664,12 @@ class Broker:
                 await self.infra.nft_session_del(ip)
                 await self.infra.conntrack_flush(ip)
             except InfraError as exc:
-                log.error("[%s] retrait nft : %s", slot_name, exc)
+                log.error("[%s] nft removal: %s", slot_name, exc)
         if token:
             try:
                 await self.infra.haproxy_del(token)
             except InfraError as exc:
-                log.error("[%s] retrait HAProxy : %s", slot_name, exc)
+                log.error("[%s] HAProxy removal: %s", slot_name, exc)
 
     async def _recycle(self, slot: Slot, ip: str | None, token: str | None) -> None:
         await self._revoke(slot.name, ip, token)
@@ -677,7 +677,7 @@ class Broker:
             await self.infra.recycle(slot.cfg)
         except (InfraError, OSError) as exc:
             async with self.lock:
-                self._mark_down(slot, f"échec du redémarrage : {exc}")
+                self._mark_down(slot, f"restart failed: {exc}")
             return
         deadline = self.now() + self.cfg.recycle_timeout_s
         oks = 0
@@ -689,7 +689,7 @@ class Broker:
                     async with self.lock:
                         if slot.state == State.RECYCLING:
                             slot.fails = slot.oks = 0
-                            self._set_state(slot, State.FREE, "recyclé, conteneur sain")
+                            self._set_state(slot, State.FREE, "recycled, container healthy")
                             self.persist()
                     return
             else:
@@ -697,7 +697,7 @@ class Broker:
             await asyncio.sleep(poll)
         async with self.lock:
             if slot.state == State.RECYCLING:
-                self._mark_down(slot, f"pas sain {self.cfg.recycle_timeout_s:.0f} s après redémarrage")
+                self._mark_down(slot, f"not healthy {self.cfg.recycle_timeout_s:.0f} s after restart")
 
     def _mark_down(self, slot: Slot, reason: str) -> None:
         ip, token = slot.client_ip, slot.token
@@ -709,13 +709,13 @@ class Broker:
         if ip or token:
             self._spawn(self._revoke(slot.name, ip, token))
 
-    # ── boucles de surveillance ───────────────────────────────────────────
+    # ── monitoring loops ──────────────────────────────────────────────────
     async def activity_tick(self) -> None:
-        """RESERVED -> IN_USE, RESERVED/IN_USE -> RECYCLING selon le trafic UDP."""
+        """RESERVED -> IN_USE, RESERVED/IN_USE -> RECYCLING based on UDP traffic."""
         try:
             seen = await self.infra.nft_seen()
         except (InfraError, ValueError) as exc:
-            log.warning("lecture de l'activité UDP impossible (%s) : aucune décision ce cycle", exc)
+            log.warning("cannot read UDP activity (%s): no decision this cycle", exc)
             return
         async with self.lock:
             now = self.now()
@@ -723,17 +723,17 @@ class Broker:
                 if slot.state == State.RESERVED:
                     if slot.client_ip in seen:
                         slot.last_activity = now
-                        self._set_state(slot, State.IN_USE, "trafic UDP reçu")
+                        self._set_state(slot, State.IN_USE, "UDP traffic seen")
                         self.persist()
                     elif now - slot.since >= self.cfg.reserve_timeout_s:
                         self._begin_recycle(
-                            slot, f"aucun trafic UDP en {self.cfg.reserve_timeout_s:.0f} s")
+                            slot, f"no UDP traffic within {self.cfg.reserve_timeout_s:.0f} s")
                 elif slot.state == State.IN_USE:
                     if slot.client_ip in seen:
                         slot.last_activity = now
                     elif now >= self.grace_until:
                         self._begin_recycle(
-                            slot, f"plus de trafic depuis {self.cfg.idle_timeout_s} s")
+                            slot, f"no traffic for {self.cfg.idle_timeout_s} s")
 
     async def health_tick(self) -> None:
         targets = [s for s in self.slots.values() if s.state != State.RECYCLING]
@@ -741,27 +741,27 @@ class Broker:
         async with self.lock:
             now = self.now()
             for slot, ok in zip(targets, results):
-                if slot.state == State.RECYCLING:      # a changé pendant le check
+                if slot.state == State.RECYCLING:      # changed during the check
                     continue
                 if ok:
                     slot.fails, slot.oks = 0, slot.oks + 1
                     if slot.state == State.DOWN and slot.oks >= self.cfg.health_rise:
-                        self._begin_recycle(slot, "conteneur de nouveau joignable")
+                        self._begin_recycle(slot, "container reachable again")
                 else:
                     slot.oks, slot.fails = 0, slot.fails + 1
                     if slot.state != State.DOWN and slot.fails >= self.cfg.health_fall:
-                        self._mark_down(slot, f"{slot.fails} health checks échoués")
-                # relance automatique d'un conteneur en panne
+                        self._mark_down(slot, f"{slot.fails} failed health checks")
+                # automatic retry of a failed container
                 if (slot.state == State.DOWN and
                         now - slot.since >= self.cfg.down_retry_s):
-                    self._begin_recycle(slot, "relance automatique après panne")
+                    self._begin_recycle(slot, "automatic retry after failure")
 
     async def reconcile_tick(self) -> None:
-        """Auto-réparation : table nft effacée (reload du pare-feu), HAProxy redémarré…"""
+        """Self-healing: nft table wiped (firewall reload), HAProxy restarted…"""
         try:
             async with self.lock:
                 if not await self.infra.nft_table_ok():
-                    log.warning("table nftables absente (pare-feu rechargé ?) : reconstruction")
+                    log.warning("nftables table missing (firewall reloaded?): rebuilding")
                     await self.infra.nft_load()
                     self._grace()
                 have = await self.infra.nft_sessions()
@@ -769,23 +769,23 @@ class Broker:
                         if s.client_ip and s.state in (State.RESERVED, State.IN_USE)}
                 for ip, slot in want.items():
                     if have.get(ip) != f"{slot.cfg.ip}.{slot.cfg.udp_port}":
-                        log.warning("[%s] redirection UDP manquante pour %s : rétablie",
+                        log.warning("[%s] missing UDP redirection for %s: restored",
                                     slot.name, ip)
                         await self.infra.nft_session_add(ip, slot.cfg)
                 for ip in have.keys() - want.keys():
-                    log.warning("redirection UDP orpheline pour %s : supprimée", ip)
+                    log.warning("orphan UDP redirection for %s: removed", ip)
                     await self.infra.nft_session_del(ip)
                     await self.infra.conntrack_flush(ip)
         except (InfraError, ValueError) as exc:
-            log.warning("réconciliation nft : %s", exc)
+            log.warning("nft reconciliation: %s", exc)
         await self._sync_haproxy()
 
     async def _loop(self, period: float, fn) -> None:
         while not self._stopping:
             try:
                 await fn()
-            except Exception:                     # une boucle ne doit jamais mourir
-                log.exception("erreur dans %s", fn.__name__)
+            except Exception:                     # a loop must never die
+                log.exception("error in %s", fn.__name__)
             await asyncio.sleep(period)
 
     def run_loops(self) -> list[asyncio.Task]:
@@ -798,17 +798,17 @@ class Broker:
         for t in list(self._bg):
             t.cancel()
         await asyncio.gather(*self._bg, return_exceptions=True)
-        # Un recyclage interrompu reste RECYCLING dans l'état : il sera repris au démarrage.
+        # An interrupted recycle stays RECYCLING in the state file: it resumes at startup.
         self.persist()
 
-    # ── observabilité ─────────────────────────────────────────────────────
+    # ── observability ─────────────────────────────────────────────────────
     def status(self) -> dict:
         now = self.now()
         return {"slots": [s.public(now) for s in self.slots.values()],
                 "queue": len(self.queue), "stats": self.stats, "version": __version__}
 
     def metrics(self) -> str:
-        out = ["# HELP kyber_slot_state 1 si le slot est dans cet état",
+        out = ["# HELP kyber_slot_state 1 if the slot is in this state",
                "# TYPE kyber_slot_state gauge"]
         for s in self.slots.values():
             for st in State:
@@ -828,7 +828,7 @@ class Broker:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Serveur HTTP minimal (derrière HAProxy, en local uniquement)
+#  Minimal HTTP server (behind HAProxy, local only)
 # ═══════════════════════════════════════════════════════════════════════════
 
 PAGE_CSS = """
@@ -849,7 +849,7 @@ padding:5px 10px;cursor:pointer}button:hover{background:#333846}
 
 def page(title: str, body: str, refresh: int | None = None) -> str:
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
-    return (f'<!doctype html><html lang="fr"><head><meta charset="utf-8">'
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">{meta}'
             f"<title>{html.escape(title)}</title><style>{PAGE_CSS}</style></head>"
             f'<body><div class="card">{body}</div></body></html>')
@@ -866,7 +866,7 @@ class HttpServer:
         try:
             raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
             if len(raw) > self.MAX_HEADER:
-                raise ValueError("en-têtes trop longs")
+                raise ValueError("headers too long")
             head = raw.decode("latin-1").split("\r\n")
             method, target, _ = head[0].split(" ", 2)
             headers: dict[str, str] = {}
@@ -879,10 +879,10 @@ class HttpServer:
             status, hdrs, body = await self.route(method, target, headers, peer)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError,
                 asyncio.TimeoutError, ValueError, ConnectionError):
-            status, hdrs, body = 400, {"Content-Type": "text/plain"}, "requête invalide\n"
+            status, hdrs, body = 400, {"Content-Type": "text/plain"}, "bad request\n"
         except Exception:
-            log.exception("erreur HTTP")
-            status, hdrs, body = 500, {"Content-Type": "text/plain"}, "erreur interne\n"
+            log.exception("HTTP error")
+            status, hdrs, body = 500, {"Content-Type": "text/plain"}, "internal error\n"
         data = body.encode() if isinstance(body, str) else body
         reasons = {200: "OK", 303: "See Other", 400: "Bad Request", 403: "Forbidden",
                    404: "Not Found", 405: "Method Not Allowed", 409: "Conflict",
@@ -900,7 +900,7 @@ class HttpServer:
             writer.close()
 
     def client_ip(self, headers: dict[str, str], peer: str) -> str | None:
-        # On ne fait confiance à X-Forwarded-For que s'il vient de HAProxy (connexion locale).
+        # Only trust X-Forwarded-For when it comes from HAProxy (local connection).
         ip = peer
         if ipaddress.ip_address(peer).is_loopback and headers.get("x-forwarded-for"):
             ip = headers["x-forwarded-for"].split(",")[-1].strip()
@@ -937,49 +937,49 @@ class HttpServer:
             return 200, {"Content-Type": "text/plain"}, "ok\n"
 
         if ip is None:
-            return 400, html_ct, page("Kyber", "<h1>Adresse non prise en charge</h1>"
-                                      "<p>Kyber n'accepte que les clients IPv4.</p>")
+            return 400, html_ct, page("Kyber", "<h1>Unsupported address</h1>"
+                                      "<p>Kyber only accepts IPv4 clients.</p>")
 
         # ── administration ────────────────────────────────────────────────
         if path.startswith("/_kyber/admin") or path in ("/_kyber/status", "/_kyber/metrics"):
             if not self.b.is_admin(ip):
-                return 403, {"Content-Type": "text/plain"}, "interdit\n"
+                return 403, {"Content-Type": "text/plain"}, "forbidden\n"
             if path == "/_kyber/status":
                 return 200, {"Content-Type": "application/json"}, json.dumps(self.b.status(), indent=2)
             if path == "/_kyber/metrics":
                 return 200, {"Content-Type": "text/plain; version=0.0.4"}, self.b.metrics()
             if path == "/_kyber/admin/recycle":
                 if method != "POST":
-                    return 405, {"Content-Type": "text/plain"}, "POST attendu\n"
+                    return 405, {"Content-Type": "text/plain"}, "POST expected\n"
                 ok = await self.b.admin_recycle(query.get("slot", [""])[0])
                 return 303, {"Location": "/_kyber/admin"}, ""
             return 200, html_ct, self.admin_page()
 
         token = self.cookie(headers)
 
-        # ── le joueur quitte ──────────────────────────────────────────────
+        # ── the player leaves ─────────────────────────────────────────────
         if path == "/_kyber/leave":
             await self.b.leave(token, ip)
             return 200, {**html_ct, "Set-Cookie": self.set_cookie("", clear=True)}, page(
-                "Session terminée", "<h1>Session terminée</h1><p>Le poste est en cours de "
-                "nettoyage pour le joueur suivant. Merci d'avoir joué !</p>"
-                '<p><a href="/" style="color:var(--acc)">Rejouer</a></p>')
+                "Session ended", "<h1>Session ended</h1><p>The station is being "
+                "cleaned up for the next player. Thanks for playing!</p>"
+                '<p><a href="/" style="color:var(--acc)">Play again</a></p>')
 
-        # ── cookie valide mais HAProxy nous a quand même envoyé ici ──────
+        # ── valid cookie, but HAProxy still sent us here ─────────────────
         slot = self.b.by_token(token)
         if slot and slot.state in (State.RESERVED, State.IN_USE) and not path.startswith("/_kyber/"):
             self.b._spawn(self.b._sync_haproxy())
             return 503, {**html_ct, "Retry-After": "2"}, page(
-                "Préparation…", "<h1>Préparation de votre session…</h1>"
-                "<p>Encore un instant.</p>", refresh=2)
+                "Preparing…", "<h1>Preparing your session…</h1>"
+                "<p>Just a moment.</p>", refresh=2)
 
         if method not in ("GET", "HEAD"):
-            return 409, {"Content-Type": "text/plain"}, "aucune session : rechargez la page\n"
+            return 409, {"Content-Type": "text/plain"}, "no session: reload the page\n"
 
-        # ── attribution d'un conteneur ───────────────────────────────────
+        # ── container assignment ─────────────────────────────────────────
         if "_ub" in query and not token:
-            return 400, html_ct, page("Cookies requis", "<h1>Cookies désactivés</h1><p>Kyber "
-                                      "utilise un cookie pour vous relier à votre poste.</p>")
+            return 400, html_ct, page("Cookies required", "<h1>Cookies disabled</h1><p>Kyber "
+                                      "uses a cookie to link you to your station.</p>")
         result, slot, pos = await self.b.assign(ip)
         if result == "assigned":
             back = path if not path.startswith("/_kyber/") else "/"
@@ -987,10 +987,10 @@ class HttpServer:
                          "Set-Cookie": self.set_cookie(slot.token)}, ""
         total = len(self.b.slots)
         return 503, {**html_ct, "Retry-After": "5"}, page(
-            "File d'attente", "<h1>Tous les postes sont occupés</h1>"
-            f"<p>Votre position dans la file d'attente :</p><div class=big>{pos}</div>"
-            f"<p>{total} poste(s) au total. Cette page se recharge toute seule : "
-            "gardez-la ouverte.</p>", refresh=5)
+            "Queue", "<h1>All stations are busy</h1>"
+            f"<p>Your position in the queue:</p><div class=big>{pos}</div>"
+            f"<p>{total} station(s) in total. This page reloads by itself: "
+            "keep it open.</p>", refresh=5)
 
     def admin_page(self) -> str:
         st = self.b.status()
@@ -1000,18 +1000,18 @@ class HttpServer:
             f"<td>{html.escape(s['client_ip'] or '—')}</td><td>{s['for_s']} s</td>"
             f"<td>{html.escape(s['reason'])}</td>"
             f"<td><form method=post action='/_kyber/admin/recycle?slot={html.escape(s['slot'])}'>"
-            f"<button>Recycler</button></form></td></tr>" for s in st["slots"])
+            f"<button>Recycle</button></form></td></tr>" for s in st["slots"])
         stats = st["stats"]
         return page("Kyber — administration",
-                    "<h1>Kyber — postes</h1>"
-                    f"<p>File d'attente : {st['queue']} · sessions : {stats['sessions_total']} · "
-                    f"recyclages : {stats['recycles_total']} · pannes : {stats['down_total']}</p>"
-                    "<table><tr><th>Slot</th><th>Conteneur</th><th>État</th><th>Joueur</th>"
-                    f"<th>Depuis</th><th>Raison</th><th></th></tr>{rows}</table>", refresh=5)
+                    "<h1>Kyber — stations</h1>"
+                    f"<p>Queue: {st['queue']} · sessions: {stats['sessions_total']} · "
+                    f"recycles: {stats['recycles_total']} · failures: {stats['down_total']}</p>"
+                    "<table><tr><th>Slot</th><th>Container</th><th>State</th><th>Player</th>"
+                    f"<th>For</th><th>Reason</th><th></th></tr>{rows}</table>", refresh=5)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Point d'entrée
+#  Entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def serve(cfg: Config) -> None:
@@ -1021,27 +1021,27 @@ async def serve(cfg: Config) -> None:
     server = await asyncio.start_server(HttpServer(broker).handle, cfg.listen_host,
                                         cfg.listen_port, limit=HttpServer.MAX_HEADER)
     loops = broker.run_loops()
-    log.info("écoute sur http://%s:%d", cfg.listen_host, cfg.listen_port)
+    log.info("listening on http://%s:%d", cfg.listen_host, cfg.listen_port)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     await stop.wait()
-    log.info("arrêt demandé")
+    log.info("shutdown requested")
     server.close()
     await server.wait_closed()
     await broker.stop()
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="ky-broker — broker de sessions Kyber")
+    ap = argparse.ArgumentParser(description="ky-broker — Kyber session broker")
     ap.add_argument("-c", "--config", default="/etc/kyber/broker.toml")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("run", help="lancer le broker")
-    sub.add_parser("check", help="valider la configuration")
-    sub.add_parser("render-haproxy", help="afficher le haproxy.cfg correspondant")
-    sub.add_parser("render-nft", help="afficher les règles nftables")
+    sub.add_parser("run", help="run the broker")
+    sub.add_parser("check", help="validate the configuration")
+    sub.add_parser("render-haproxy", help="print the matching haproxy.cfg")
+    sub.add_parser("render-nft", help="print the nftables rules")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(levelname)s %(message)s" if os.environ.get("INVOCATION_ID")
@@ -1049,10 +1049,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cfg = Config.load(a.config)
     except (OSError, ValueError, TypeError, tomllib.TOMLDecodeError) as exc:
-        print(f"configuration invalide : {exc}", file=sys.stderr)
+        print(f"invalid configuration: {exc}", file=sys.stderr)
         return 2
     if a.cmd == "check":
-        print(f"OK — {len(cfg.slots)} slot(s) : " + ", ".join(
+        print(f"OK — {len(cfg.slots)} slot(s): " + ", ".join(
             f"{s.name}→{s.container} ({s.ip})" for s in cfg.slots))
         return 0
     if a.cmd == "render-haproxy":

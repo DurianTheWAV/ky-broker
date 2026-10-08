@@ -1,115 +1,115 @@
-# ky-broker — un point d'entrée unique vers plusieurs conteneurs Kyber
+# ky-broker — a single entry point to several Kyber containers
 
-Les joueurs n'utilisent qu'**une IP et deux ports** (443/tcp pour la page web, 9000/udp pour le flux).
-Le broker attribue à chaque nouveau joueur un conteneur Kyber **libre**, saute ceux qui sont occupés,
-met les joueurs en file d'attente quand tout est pris, et **redémarre le conteneur entre deux joueurs**.
+Players only use **one IP and two ports** (443/tcp for the web page, 9000/udp for the stream).
+The broker assigns each new player a **free** Kyber container, skips busy ones,
+queues players when everything is taken, and **restarts the container between two players**.
 
 ```
-Joueur 192.168.1.50 ─┬─ TCP 443 ─► HAProxy ─┬─ cookie valide ──────────► conteneur k1 (page Kyber, WebSocket)
-                     │                      └─ pas de cookie ─► broker ─► choisit un conteneur FREE,
-                     │                                                    pose le cookie, programme nft
-                     └─ UDP 9000 ─► noyau (nftables) : DNAT selon l'IP source ─► conteneur k1:9000
+Player 192.168.1.50 ─┬─ TCP 443 ─► HAProxy ─┬─ valid cookie ────────────► container k1 (Kyber page, WebSocket)
+                     │                      └─ no cookie ─► broker ─► picks a FREE container,
+                     │                                                sets the cookie, programs nft
+                     └─ UDP 9000 ─► kernel (nftables): DNAT by source IP ─► container k1:9000
 ```
 
-## 1. Le principe : plan de contrôle et plan de données
+## 1. The idea: control plane and data plane
 
-| Rôle | Qui | Ce qu'il fait |
+| Role | Who | What it does |
 |---|---|---|
-| **Plan de contrôle** | `ky_broker.py` (Python) | Décide qui va où, surveille l'activité et la santé, recycle les conteneurs |
-| **Plan de données web** | HAProxy | Route chaque requête selon le cookie `KYBER_SESSION`, via une *map* modifiée à chaud |
-| **Plan de données UDP** | Noyau Linux (nftables) | Redirige les paquets selon l'IP du joueur, via une *map* nft modifiée à chaud |
+| **Control plane** | `ky_broker.py` (Python) | Decides who goes where, monitors activity and health, recycles containers |
+| **Web data plane** | HAProxy | Routes each request by the `KYBER_SESSION` cookie, through a *map* updated live |
+| **UDP data plane** | Linux kernel (nftables) | Redirects packets by player IP, through an nft *map* updated live |
 
-**Aucun paquet de jeu ne passe par Python** : la latence ajoutée est nulle et le conteneur voit la vraie IP
-du joueur. HAProxy Community ne sait pas relayer l'UDP, c'est pourquoi l'UDP est confié au noyau.
+**No game packet goes through Python**: zero added latency, and the container sees the player's
+real IP. HAProxy Community cannot relay UDP, which is why UDP is handed to the kernel.
 
-## 2. La machine à états
+## 2. The state machine
 
 ```
-FREE ──(joueur attribué)──► RESERVED ──(trafic UDP reçu)──► IN_USE
- ▲                              │ (rien reçu en 60 s)          │ (plus de trafic depuis N s)
+FREE ──(player assigned)──► RESERVED ──(UDP traffic seen)──► IN_USE
+ ▲                              │ (nothing within 60 s)        │ (no traffic for N s)
  │                              ▼                              ▼
  └────────── RECYCLING ◄────────┴──────────────────────────────┘
-          (podman restart, puis retour à FREE)
+          (podman restart, then back to FREE)
 
-N'importe quel état ──(health check échoue)──► DOWN ──(de nouveau sain / relance auto)──► RECYCLING
+Any state ──(health check fails)──► DOWN ──(healthy again / automatic retry)──► RECYCLING
 ```
 
-| Transition | Déclencheur | Actions du broker |
+| Transition | Trigger | Broker actions |
 |---|---|---|
-| FREE → RESERVED | Un joueur sans session arrive | Jeton aléatoire + cookie, entrée HAProxy, entrée nft, purge conntrack |
-| RESERVED → IN_USE | L'IP du joueur apparaît dans le set nft `seen` | — |
-| RESERVED → RECYCLING | Aucun paquet UDP pendant `reserve_timeout_s` (60 s) | Révocation (voir ci-dessous) + `podman restart` |
-| IN_USE → RECYCLING | L'IP a disparu du set `seen` (aucun paquet depuis `idle_timeout_s`) ou le joueur ouvre `/_kyber/leave` | Révocation + `podman restart` |
-| RECYCLING → FREE | `rise` health checks réussis après le redémarrage | — |
-| RECYCLING → DOWN | Redémarrage en échec, ou pas sain après `recycle_timeout_s` | — |
-| * → DOWN | `fall` health checks échoués d'affilée | Révocation de la session éventuelle |
-| DOWN → RECYCLING | Conteneur de nouveau sain, ou toutes les `down_retry_s` (relance auto) | `podman restart` |
+| FREE → RESERVED | A player without a session arrives | Random token + cookie, HAProxy entry, nft entry, conntrack flush |
+| RESERVED → IN_USE | The player's IP shows up in the nft `seen` set | — |
+| RESERVED → RECYCLING | No UDP packet for `reserve_timeout_s` (60 s) | Revocation (see below) + `podman restart` |
+| IN_USE → RECYCLING | The IP left the `seen` set (no packet for `idle_timeout_s`) or the player opens `/_kyber/leave` | Revocation + `podman restart` |
+| RECYCLING → FREE | `rise` successful health checks after the restart | — |
+| RECYCLING → DOWN | Restart failed, or not healthy after `recycle_timeout_s` | — |
+| * → DOWN | `fall` consecutive failed health checks | Revocation of any session |
+| DOWN → RECYCLING | Container healthy again, or every `down_retry_s` (automatic retry) | `podman restart` |
 
-**Révocation** = suppression du jeton dans HAProxy (l'ancien cookie ne mène plus nulle part),
-suppression de l'IP dans les maps nft, purge des flux UDP dans conntrack.
+**Revocation** = remove the token from HAProxy (the old cookie no longer leads anywhere),
+remove the IP from the nft maps, flush the UDP flows from conntrack.
 
-**Invariant** : le seul chemin vers FREE passe par RECYCLING. Un joueur ne retrouve jamais le jeu
-ni la session Steam du joueur précédent.
+**Invariant**: the only way to FREE goes through RECYCLING. A player never inherits the game
+or the Steam session of the previous player.
 
-### Comment l'activité UDP est mesurée
+### How UDP activity is measured
 
-La règle `udp dport 9000 update @seen { ip saddr }` est placée en priorité *mangle*, donc vue par
-**chaque** paquet (les chaînes *nat* ne voient que le premier paquet d'un flux). Chaque paquet remet le
-compte à rebours de l'IP à `idle_timeout_s`. Le broker lit simplement le set toutes les 2 s :
-IP présente = trafic récent, IP absente = inactif depuis N s. Tout le comptage se fait dans le noyau.
+The rule `udp dport 9000 update @seen { ip saddr }` sits at *mangle* priority, so it sees
+**every** packet (*nat* chains only see the first packet of a flow). Each packet resets the
+IP's countdown to `idle_timeout_s`. The broker simply reads the set every 2 s:
+IP present = recent traffic, IP absent = idle for N s. All the counting happens in the kernel.
 
-### Auto-réparation
+### Self-healing
 
-Toutes les `reconcile_s` secondes, le broker compare l'état voulu au système réel :
-table nft effacée par un rechargement du pare-feu → reconstruite ; entrée manquante ou orpheline
-→ corrigée ; HAProxy redémarré → map resynchronisée. Après une reconstruction, un délai de grâce
-évite d'éjecter les joueurs en cours pendant que le set `seen` se remplit à nouveau.
-Au redémarrage du broker, l'état est relu depuis `/var/lib/kyber/state.json` : les parties en cours
-continuent.
+Every `reconcile_s` seconds, the broker compares the desired state with the real system:
+nft table wiped by a firewall reload → rebuilt; missing or orphan entry → fixed;
+HAProxy restarted → map resynced. After a rebuild, a grace period prevents kicking out
+ongoing players while the `seen` set fills up again.
+When the broker restarts, state is reloaded from `/var/lib/kyber/state.json`: ongoing games
+carry on.
 
-## 3. Prérequis
+## 3. Requirements
 
-- CachyOS, Python ≥ 3.11 (aucune bibliothèque externe)
+- CachyOS, Python ≥ 3.11 (no external library)
 - `sudo pacman -S --needed haproxy nftables conntrack-tools curl socat`
-- Les conteneurs Kyber Podman (rootful) déjà fonctionnels, **avec une IP fixe chacun**
-- Un port UDP Kyber identique dans chaque conteneur (par défaut ici : 9000)
+- Working Kyber Podman containers (rootful), **each with a fixed IP**
+- The same Kyber UDP port in every container (default here: 9000)
 
-### Point à vérifier sur Kyber avant tout
+### Check this on Kyber first
 
-Pendant une session, dans un conteneur : `podman exec kyber-1 ss -tulpn`.
-Notez le **port TCP** du serveur web (→ `web_port`) et le **port UDP** du flux (→ `udp_port`).
-Mettez `public_port` égal à ce port UDP : le webclient se connecte en général au même port que celui
-du serveur. Si le flux passe par WebTransport sur le port HTTPS (443/udp), mettez `public_port = 443`.
+During a session, inside a container: `podman exec kyber-1 ss -tulpn`.
+Note the web server's **TCP port** (→ `web_port`) and the stream's **UDP port** (→ `udp_port`).
+Set `public_port` to that UDP port: the webclient usually connects to the same port as the
+server. If the stream goes over WebTransport on the HTTPS port (443/udp), set `public_port = 443`.
 
 ## 4. Installation
 
-### 4.1 Conteneurs : IP fixes, aucun port publié
+### 4.1 Containers: fixed IPs, no published ports
 
-Le broker route directement vers l'IP de chaque conteneur. Retirez les `-p`/`--publish` et fixez l'IP :
+The broker routes straight to each container's IP. Remove `-p`/`--publish` and pin the IP:
 
 ```bash
-sudo podman run -d --name kyber-1 --ip 10.88.0.11 ...   # vos options habituelles (--privileged, CDI…)
+sudo podman run -d --name kyber-1 --ip 10.88.0.11 ...   # your usual options (--privileged, CDI…)
 sudo podman run -d --name kyber-2 --ip 10.88.0.12 ...
 sudo podman inspect -f '{{.Name}} {{.NetworkSettings.IPAddress}}' kyber-1 kyber-2
 ```
 
-Avec `--network host` à la place : `ip` = IP LAN de l'hôte et des ports différents par conteneur.
+With `--network host` instead: `ip` = the host's LAN IP, and a different port per container.
 
-### 4.2 Fichiers
+### 4.2 Files
 
 ```bash
 sudo install -d /opt/kyber /etc/kyber
 sudo install -m 755 ky_broker.py /opt/kyber/
 sudo install -m 644 README.md /opt/kyber/
 sudo install -m 640 broker.toml /etc/kyber/broker.toml
-sudo nano /etc/kyber/broker.toml        # IP, ports, noms des conteneurs, réseau admin
+sudo nano /etc/kyber/broker.toml        # IPs, ports, container names, admin network
 sudo python3 /opt/kyber/ky_broker.py -c /etc/kyber/broker.toml check
 ```
 
-### 4.3 Certificat HTTPS
+### 4.3 HTTPS certificate
 
-Le webclient Kyber utilise des API (WebAssembly, WebCodecs, WebTransport…) que les navigateurs
-réservent aux pages HTTPS. Pour le réseau local, un certificat auto-signé suffit :
+The Kyber webclient uses APIs (WebAssembly, WebCodecs, WebTransport…) that browsers only
+allow on HTTPS pages. On a local network, a self-signed certificate is enough:
 
 ```bash
 sudo install -d -m 750 -g haproxy /etc/haproxy/certs
@@ -120,27 +120,27 @@ sudo sh -c 'cat /tmp/kyber.crt /tmp/kyber.key > /etc/haproxy/certs/kyber.pem && 
 sudo chmod 640 /etc/haproxy/certs/kyber.pem && sudo chgrp haproxy /etc/haproxy/certs/kyber.pem
 ```
 
-Remplacez `192.168.1.10` par l'IP du serveur. Chaque client doit accepter (ou importer) le certificat
-une fois. Sans HTTPS : `tls_cert = ""` et `cookie_secure = false`.
+Replace `192.168.1.10` with the server's IP. Each client must accept (or import) the certificate
+once. Without HTTPS: `tls_cert = ""` and `cookie_secure = false`.
 
 ### 4.4 HAProxy
 
 ```bash
 sudo install -m 644 systemd/kyber.tmpfiles.conf /etc/tmpfiles.d/kyber.conf
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/kyber.conf    # crée la map vide : HAProxy l'exige
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/kyber.conf    # creates the empty map: HAProxy requires it
 sudo cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.orig
 sudo sh -c 'python3 /opt/kyber/ky_broker.py -c /etc/kyber/broker.toml render-haproxy > /etc/haproxy/haproxy.cfg'
 sudo haproxy -c -f /etc/haproxy/haproxy.cfg
 sudo systemctl enable --now haproxy
 ```
 
-Ajouter un conteneur = un bloc `[[slot]]` de plus, puis régénérer `haproxy.cfg` et
+Adding a container = one more `[[slot]]` block, then regenerate `haproxy.cfg` and
 `sudo systemctl reload haproxy`.
 
-### 4.5 Pare-feu
+### 4.5 Firewall
 
-Ouvrez les deux ports d'entrée, et autorisez le **transfert** vers le réseau Podman
-(le DNAT fait passer les paquets UDP dans la chaîne *forward*). Avec ufw :
+Open both entry ports, and allow **forwarding** to the Podman network
+(DNAT sends UDP packets through the *forward* chain). With ufw:
 
 ```bash
 sudo ufw allow 443/tcp
@@ -148,9 +148,9 @@ sudo ufw allow 9000/udp
 sudo ufw route allow proto udp to 10.88.0.0/16 port 9000
 ```
 
-Avec firewalld : `sudo firewall-cmd --permanent --add-port={443/tcp,9000/udp} && sudo firewall-cmd --reload`.
+With firewalld: `sudo firewall-cmd --permanent --add-port={443/tcp,9000/udp} && sudo firewall-cmd --reload`.
 
-### 4.6 Service systemd
+### 4.6 systemd service
 
 ```bash
 sudo install -m 644 systemd/ky-broker.service /etc/systemd/system/
@@ -159,58 +159,58 @@ sudo systemctl enable --now ky-broker
 journalctl -u ky-broker -f
 ```
 
-Au tout premier démarrage, le broker redémarre chaque conteneur (il ne sait pas qui les a utilisés
-avant lui) : comptez quelques dizaines de secondes avant que les postes passent en FREE.
+On the very first start, the broker restarts every container (it cannot know who used them
+before it): allow a few dozen seconds before the stations turn FREE.
 
-## 5. Utilisation
+## 5. Usage
 
-| Qui | Adresse | Effet |
+| Who | Address | Effect |
 |---|---|---|
-| Joueur | `https://<serveur>/` | Attribution d'un poste libre, ou file d'attente (page qui se recharge seule) |
-| Joueur | `https://<serveur>/_kyber/leave` | Termine la session tout de suite et libère le poste |
-| Admin | `https://<serveur>/_kyber/admin` | Tableau des postes, bouton « Recycler » |
-| Admin | `https://<serveur>/_kyber/status` | État en JSON |
-| Admin | `https://<serveur>/_kyber/metrics` | Métriques Prometheus (pour Grafana) |
+| Player | `https://<server>/` | Assigns a free station, or queues (self-reloading page) |
+| Player | `https://<server>/_kyber/leave` | Ends the session immediately and frees the station |
+| Admin | `https://<server>/_kyber/admin` | Station table, "Recycle" button |
+| Admin | `https://<server>/_kyber/status` | State as JSON |
+| Admin | `https://<server>/_kyber/metrics` | Prometheus metrics (for Grafana) |
 
-Les pages d'administration ne répondent qu'aux réseaux listés dans `admin_networks`.
+The admin pages only answer the networks listed in `admin_networks`.
 
-## 6. Vérifications
+## 6. Checks
 
 ```bash
-sudo nft list table ip kyber                    # règles, sessions, IP actives (set seen)
+sudo nft list table ip kyber                    # rules, sessions, active IPs (seen set)
 echo "show map /etc/haproxy/maps/kyber-sessions.map" | sudo socat - /run/haproxy/admin.sock
-sudo conntrack -L -p udp --orig-port-dst 9000    # flux UDP en cours et leur redirection
+sudo conntrack -L -p udp --orig-port-dst 9000    # ongoing UDP flows and their redirection
 curl -sk https://127.0.0.1/_kyber/status | python3 -m json.tool
 ```
 
 ## 7. Tests
 
 ```bash
-python3 -m unittest -v test_ky_broker.py         # 20 tests de la machine à états, sans root
-sudo ./maquette/maquette.sh                      # maquette réseau réelle (~1 min), voir ci-dessous
+python3 -m unittest -v test_ky_broker.py         # 20 state machine tests, no root needed
+sudo ./maquette/maquette.sh                      # real network mock-up (~1 min), see below
 ```
 
-La maquette crée trois namespaces réseau isolés (hôte, faux conteneurs Kyber, joueurs) avec un vrai
-HAProxy et de vraies règles nftables, et déroule : attribution, load balancing, file d'attente, UDP sur
-le port unique, inactivité et recyclage, rechargement du pare-feu, panne d'un conteneur.
-Elle ne touche ni au réseau de l'hôte ni aux conteneurs. Sa sortie est une bonne capture pour le rapport.
+The mock-up creates three isolated network namespaces (host, fake Kyber containers, players) with a
+real HAProxy and real nftables rules, and walks through: assignment, load balancing, queue, UDP on
+the single port, idleness and recycling, firewall reload, container failure.
+It touches neither the host network nor the containers. Its output makes a good capture for a report.
 
-## 8. Dépannage
+## 8. Troubleshooting
 
-| Symptôme | Piste |
+| Symptom | Lead |
 |---|---|
-| HAProxy ne démarre pas : *failed to open pattern file* | La map n'existe pas : `sudo systemd-tmpfiles --create /etc/tmpfiles.d/kyber.conf` |
-| Page web OK, mais pas d'image | Port UDP : vérifier `udp_port`/`public_port` (§3), le pare-feu (§4.5), puis `sudo conntrack -L -p udp` |
-| Le poste reste RESERVED puis est recyclé | Aucun paquet UDP n'arrive sur `public_port` : `sudo nft list set ip kyber seen` pendant la connexion |
-| Les postes passent DOWN | `podman ps`, `curl http://10.88.0.11:8080/`, puis le journal du conteneur |
-| Tests depuis le serveur lui-même | Ne marchent pas pour l'UDP : le trafic local ne passe pas par *prerouting*. Testez depuis un autre PC |
-| « Préparation de votre session… » en boucle | Le broker n'arrive pas à écrire dans HAProxy : vérifier le socket `/run/haproxy/admin.sock` |
+| HAProxy won't start: *failed to open pattern file* | The map does not exist: `sudo systemd-tmpfiles --create /etc/tmpfiles.d/kyber.conf` |
+| Web page OK, but no picture | UDP port: check `udp_port`/`public_port` (§3), the firewall (§4.5), then `sudo conntrack -L -p udp` |
+| The station stays RESERVED, then gets recycled | No UDP packet reaches `public_port`: `sudo nft list set ip kyber seen` while connecting |
+| Stations go DOWN | `podman ps`, `curl http://10.88.0.11:8080/`, then the container's log |
+| Testing from the server itself | Does not work for UDP: local traffic does not go through *prerouting*. Test from another PC |
+| "Preparing your session…" loops forever | The broker cannot write to HAProxy: check the `/run/haproxy/admin.sock` socket |
 
-## 9. Limites connues
+## 9. Known limitations
 
-- **Une session par IP.** L'UDP est routé selon l'IP source : deux joueurs derrière la même box
-  partageraient le même poste. Sans conséquence sur un réseau local ; pour Internet, prévoir un VPN
-  (WireGuard donne une IP distincte à chaque joueur).
-- **IPv4 uniquement.**
-- **Un seul hôte.** Le broker gère les conteneurs d'une machine ; plusieurs serveurs demanderaient
-  un état partagé.
+- **One session per IP.** UDP is routed by source IP: two players behind the same router
+  would share the same station. Harmless on a LAN; for the Internet, use a VPN
+  (WireGuard gives each player a distinct IP).
+- **IPv4 only.**
+- **Single host.** The broker manages the containers of one machine; several servers would
+  require shared state.
