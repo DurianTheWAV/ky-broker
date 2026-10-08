@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Umbria broker — un point d'entrée unique (IP + port) vers plusieurs conteneurs Kyber.
+ky-broker — un point d'entrée unique (IP + port) vers plusieurs conteneurs Kyber.
 
 Chaque conteneur (« slot ») suit la machine à états :
 
@@ -47,7 +47,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 __version__ = "1.0.0"
-log = logging.getLogger("umbria")
+log = logging.getLogger("kyber")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -69,11 +69,11 @@ class Config:
     # [broker]
     listen_host: str = "127.0.0.1"
     listen_port: int = 8099
-    state_file: str = "/var/lib/umbria/state.json"
+    state_file: str = "/var/lib/kyber/state.json"
     tick_s: float = 2.0
     reserve_timeout_s: float = 60.0
     idle_timeout_s: int = 30
-    cookie_name: str = "UMBRIA_SESSION"
+    cookie_name: str = "KYBER_SESSION"
     cookie_secure: bool = True
     admin_networks: list[str] = field(default_factory=lambda: ["127.0.0.0/8"])
     queue_ttl_s: float = 20.0
@@ -81,10 +81,10 @@ class Config:
     # [udp]
     udp_public_port: int = 9000
     udp_interface: str = ""
-    nft_table: str = "umbria"
+    nft_table: str = "kyber"
     # [haproxy]
     haproxy_socket: str = "/run/haproxy/admin.sock"
-    haproxy_map: str = "/etc/haproxy/maps/umbria-sessions.map"
+    haproxy_map: str = "/etc/haproxy/maps/kyber-sessions.map"
     haproxy_bind: str = "*:443"
     haproxy_tls_cert: str = ""
     # [health]
@@ -166,7 +166,7 @@ def render_nft(cfg: Config) -> str:
     iif = f'iifname "{cfg.udp_interface}" ' if cfg.udp_interface else ""
     t, p = cfg.nft_table, cfg.udp_public_port
     return f"""\
-# Généré par umbria_broker — ne pas modifier à la main.
+# Généré par ky_broker — ne pas modifier à la main.
 # « table puis delete table » rend le chargement idempotent.
 table ip {t}
 delete table ip {t}
@@ -206,7 +206,7 @@ def render_haproxy(cfg: Config) -> str:
     if tls:
         bind += f" ssl crt {tls} alpn h2,http/1.1"
     lines = [
-        "# Généré par umbria_broker render-haproxy — régénérer plutôt que modifier.",
+        "# Généré par ky_broker render-haproxy — régénérer plutôt que modifier.",
         "global",
         "    log /dev/log local0",
         f"    stats socket {cfg.haproxy_socket} mode 660 level admin expose-fd listeners",
@@ -224,14 +224,14 @@ def render_haproxy(cfg: Config) -> str:
         "    timeout server  60s",
         "    timeout tunnel  4h     # WebSocket Kyber : une partie peut durer longtemps",
         "",
-        "frontend fe_umbria",
+        "frontend fe_kyber",
         f"    {bind}",
         "    # L'IP vue par le broker doit être celle posée par HAProxy, jamais celle du client",
         "    http-request del-header X-Forwarded-For",
         "    option forwardfor",
         f"    http-request set-header X-Forwarded-Proto {'https' if tls else 'http'}",
         "    # Pages du broker : file d'attente, quitter, administration",
-        "    use_backend bk_broker if { path_beg /_umbria/ }",
+        "    use_backend bk_broker if { path_beg /_kyber/ }",
         "    # Cookie de session valide -> conteneur attribué ; sinon -> broker",
         f"    use_backend %[req.cook({cfg.cookie_name}),map({cfg.haproxy_map},bk_broker)]",
         "    default_backend bk_broker",
@@ -406,7 +406,7 @@ class Infra:
             r, w = await asyncio.wait_for(
                 asyncio.open_connection(slot.ip, slot.web_port, ssl=ctx), t)
             w.write(f"GET {self.cfg.health_path} HTTP/1.1\r\nHost: {slot.ip}\r\n"
-                    f"User-Agent: umbria-health\r\nConnection: close\r\n\r\n".encode())
+                    f"User-Agent: kyber-health\r\nConnection: close\r\n\r\n".encode())
             await w.drain()
             status = await asyncio.wait_for(r.readline(), t)
             w.close()
@@ -808,15 +808,15 @@ class Broker:
                 "queue": len(self.queue), "stats": self.stats, "version": __version__}
 
     def metrics(self) -> str:
-        out = ["# HELP umbria_slot_state 1 si le slot est dans cet état",
-               "# TYPE umbria_slot_state gauge"]
+        out = ["# HELP kyber_slot_state 1 si le slot est dans cet état",
+               "# TYPE kyber_slot_state gauge"]
         for s in self.slots.values():
             for st in State:
-                out.append(f'umbria_slot_state{{slot="{s.name}",state="{st.value}"}} '
+                out.append(f'kyber_slot_state{{slot="{s.name}",state="{st.value}"}} '
                            f"{int(s.state == st)}")
-        out += ["# TYPE umbria_queue_length gauge", f"umbria_queue_length {len(self.queue)}"]
+        out += ["# TYPE kyber_queue_length gauge", f"kyber_queue_length {len(self.queue)}"]
         for k, v in self.stats.items():
-            out += [f"# TYPE umbria_{k} counter", f"umbria_{k} {v}"]
+            out += [f"# TYPE kyber_{k} counter", f"kyber_{k} {v}"]
         return "\n".join(out) + "\n"
 
     def is_admin(self, ip: str) -> bool:
@@ -933,32 +933,32 @@ class HttpServer:
         ip = self.client_ip(headers, peer)
         html_ct = {"Content-Type": "text/html; charset=utf-8"}
 
-        if path == "/_umbria/health":
+        if path == "/_kyber/health":
             return 200, {"Content-Type": "text/plain"}, "ok\n"
 
         if ip is None:
-            return 400, html_ct, page("Umbria", "<h1>Adresse non prise en charge</h1>"
-                                      "<p>Umbria n'accepte que les clients IPv4.</p>")
+            return 400, html_ct, page("Kyber", "<h1>Adresse non prise en charge</h1>"
+                                      "<p>Kyber n'accepte que les clients IPv4.</p>")
 
         # ── administration ────────────────────────────────────────────────
-        if path.startswith("/_umbria/admin") or path in ("/_umbria/status", "/_umbria/metrics"):
+        if path.startswith("/_kyber/admin") or path in ("/_kyber/status", "/_kyber/metrics"):
             if not self.b.is_admin(ip):
                 return 403, {"Content-Type": "text/plain"}, "interdit\n"
-            if path == "/_umbria/status":
+            if path == "/_kyber/status":
                 return 200, {"Content-Type": "application/json"}, json.dumps(self.b.status(), indent=2)
-            if path == "/_umbria/metrics":
+            if path == "/_kyber/metrics":
                 return 200, {"Content-Type": "text/plain; version=0.0.4"}, self.b.metrics()
-            if path == "/_umbria/admin/recycle":
+            if path == "/_kyber/admin/recycle":
                 if method != "POST":
                     return 405, {"Content-Type": "text/plain"}, "POST attendu\n"
                 ok = await self.b.admin_recycle(query.get("slot", [""])[0])
-                return 303, {"Location": "/_umbria/admin"}, ""
+                return 303, {"Location": "/_kyber/admin"}, ""
             return 200, html_ct, self.admin_page()
 
         token = self.cookie(headers)
 
         # ── le joueur quitte ──────────────────────────────────────────────
-        if path == "/_umbria/leave":
+        if path == "/_kyber/leave":
             await self.b.leave(token, ip)
             return 200, {**html_ct, "Set-Cookie": self.set_cookie("", clear=True)}, page(
                 "Session terminée", "<h1>Session terminée</h1><p>Le poste est en cours de "
@@ -967,7 +967,7 @@ class HttpServer:
 
         # ── cookie valide mais HAProxy nous a quand même envoyé ici ──────
         slot = self.b.by_token(token)
-        if slot and slot.state in (State.RESERVED, State.IN_USE) and not path.startswith("/_umbria/"):
+        if slot and slot.state in (State.RESERVED, State.IN_USE) and not path.startswith("/_kyber/"):
             self.b._spawn(self.b._sync_haproxy())
             return 503, {**html_ct, "Retry-After": "2"}, page(
                 "Préparation…", "<h1>Préparation de votre session…</h1>"
@@ -978,11 +978,11 @@ class HttpServer:
 
         # ── attribution d'un conteneur ───────────────────────────────────
         if "_ub" in query and not token:
-            return 400, html_ct, page("Cookies requis", "<h1>Cookies désactivés</h1><p>Umbria "
+            return 400, html_ct, page("Cookies requis", "<h1>Cookies désactivés</h1><p>Kyber "
                                       "utilise un cookie pour vous relier à votre poste.</p>")
         result, slot, pos = await self.b.assign(ip)
         if result == "assigned":
-            back = path if not path.startswith("/_umbria/") else "/"
+            back = path if not path.startswith("/_kyber/") else "/"
             return 303, {"Location": f"{back}?_ub=1" if back == "/" else back,
                          "Set-Cookie": self.set_cookie(slot.token)}, ""
         total = len(self.b.slots)
@@ -999,11 +999,11 @@ class HttpServer:
             f"<td class='s-{s['state']}'>{s['state']}</td>"
             f"<td>{html.escape(s['client_ip'] or '—')}</td><td>{s['for_s']} s</td>"
             f"<td>{html.escape(s['reason'])}</td>"
-            f"<td><form method=post action='/_umbria/admin/recycle?slot={html.escape(s['slot'])}'>"
+            f"<td><form method=post action='/_kyber/admin/recycle?slot={html.escape(s['slot'])}'>"
             f"<button>Recycler</button></form></td></tr>" for s in st["slots"])
         stats = st["stats"]
-        return page("Umbria — administration",
-                    "<h1>Umbria — postes</h1>"
+        return page("Kyber — administration",
+                    "<h1>Kyber — postes</h1>"
                     f"<p>File d'attente : {st['queue']} · sessions : {stats['sessions_total']} · "
                     f"recyclages : {stats['recycles_total']} · pannes : {stats['down_total']}</p>"
                     "<table><tr><th>Slot</th><th>Conteneur</th><th>État</th><th>Joueur</th>"
@@ -1034,8 +1034,8 @@ async def serve(cfg: Config) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Umbria — broker de sessions Kyber")
-    ap.add_argument("-c", "--config", default="/etc/umbria/broker.toml")
+    ap = argparse.ArgumentParser(description="ky-broker — broker de sessions Kyber")
+    ap.add_argument("-c", "--config", default="/etc/kyber/broker.toml")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("run", help="lancer le broker")
